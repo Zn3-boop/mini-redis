@@ -18,7 +18,7 @@
 | 里程碑 | 产出 | 硬验收 | 状态 |
 |---|---|---|---|
 | M0 | epoll TCP echo server | 多客户端并发压测不断链；能讲清 ET/LT | ✅ 见下 |
-| M1 | RESP2 解析器 + PING/SET/GET | 真机 redis-cli 互操作；处理 redis-cli 6+ 的 HELLO 回落 | ⬜ |
+| M1 | RESP2 解析器 + PING/SET/GET | 真机 redis-cli 互操作；处理 redis-cli 6+ 的 HELLO 回落 | 🔶 代码完成，11/11 自测绿；redis-cli 互操作待装 redis-tools |
 | M2 | 哈希表键空间 + DEL/EXPIRE/TTL 惰性过期 | redis-cli 验证 TTL 递减、过期返回 nil | ⬜ |
 | M3 | AOF 追加 + 启动回放 | SET 后 kill -9 重启，GET 读回一致 | ⬜ |
 | M4 | redis-benchmark 对拍同机 redis-server | QPS/P99 对比表 + README 取舍记录 | ⬜ |
@@ -69,6 +69,49 @@ ET 下排空是硬性要求（漏读=丢数据），LT 下是冗余但无害。
 **ET vs LT 实测观感**：相同压测下功能全绿，ET 略快（0.31s vs 0.34s）。差异不显著是预期——
 echo 是轻负载，ET 的"少唤醒"优势要在"万级空闲连接 + 大量短请求"场景才放大，这正是 Redis
 单线程事件循环选 ET 的语境。README 的取舍记录到 M4 会用 redis-benchmark 数据补全。
+
+## M1：RESP2 协议层 + PING/SET/GET
+
+### 结构
+
+- `src/resp.c/.h` — 增量式 RESP2 命令解析（NEED_MORE 处理半包/粘包）+ 回复序列化
+- `src/dict.c/.h` — 键空间哈希表（djb2 + 链地址法 + 负载>0.75 扩容），值二进制安全
+- `src/server.c` — M0 的 epoll 底座上挂协议层，命令分发大小写不敏感
+
+### 互操作已知坑（写进验收）
+
+redis-cli 6+ 连上后**先发 `HELLO 3` 做 RESP3 握手**；server 回 `-ERR unknown
+command 'HELLO'` 后它自动回落 RESP2。M1 已按此实现并单测覆盖：HELLO → ERR 回落路径 ✅
+
+### 原生 socket 自测证据（2026-11-18，WSL2 / gcc 13.3）
+
+```
+RESULT: 11/11 passed
+  PASS  PING -> +PONG
+  PASS  PING arg -> bulk
+  PASS  SET/GET roundtrip
+  PASS  GET missing -> nil
+  PASS  binary-safe value (\x00\xff)
+  PASS  case-insensitive cmd, case-sensitive key
+  PASS  HELLO -> ERR (redis-cli 6+ 回落路径)
+  PASS  wrong arg count -> ERR
+  PASS  pipeline 3-in-1 packet
+  PASS  half packet (增量解析 NEED_MORE)
+  PASS  30 concurrent x 20 ops
+```
+
+过程小坑（教学价值）：最初想当然以为"set K v 后 get k 能取到"——错，那是把命令名
+大小写不敏感误当成 key 也不敏感。**Redis 命令名不敏感、key 敏感**，与真 Redis 语义
+对齐后测试才全绿。这类"自己写协议最容易想当然"的记录比代码本身更能体现理解。
+
+### 运行
+
+```bash
+make          # 编译 mini-redis（M1）+ echo-server（M0）
+./mini-redis 7777
+make test     # M1 原生 socket 验收（11 用例）
+make test-m0  # 回归 M0 压测
+```
 
 ## 知识地图（覆盖边界）
 
