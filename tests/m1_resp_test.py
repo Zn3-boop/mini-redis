@@ -155,6 +155,14 @@ def t_pipeline():
     s.close()
 
 
+@case("ECHO -> 原样回显（redis-cli --pipe 探活依赖）")
+def t_echo():
+    s = connect()
+    s.sendall(enc_cmd("ECHO", "hello-echo"))
+    assert recv_reply(s) == ("bulk", b"hello-echo")
+    s.close()
+
+
 @case("half packet (增量解析 NEED_MORE)")
 def t_half_packet():
     s = connect()

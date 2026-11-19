@@ -65,14 +65,75 @@ static int parse_ll(const char *s, size_t n, long *out) {
     return 0;
 }
 
+/* inline 命令格式：一行纯文本，空白分隔，支持 '...' / "..." 引号。
+ * 真 Redis 的 processInlineBuffer 同款语义；redis-cli --pipe 发的正是这个。
+ * 返回：RESP_OK（argc 可能为 0 = 空行，调用方跳过）、RESP_NEED_MORE、RESP_PROTOCOL_ERROR。 */
+static int resp_parse_inline(RespBuf *rb, RespCmd *cmd) {
+    size_t ln;
+    if (scan_crlf(rb, 0, &ln) != 0) return RESP_NEED_MORE;
+
+    size_t i = 0;
+    while (i < ln && (rb->buf[i] == ' ' || rb->buf[i] == '\t')) i++;
+    if (i == ln) {
+        /* 空行：消费掉，argc=0 由调用方跳过 */
+        cmd->consumed = ln + 2;
+        return RESP_OK;
+    }
+
+    size_t tok_start[RESP_MAX_ARGC], tok_end[RESP_MAX_ARGC];
+    int argc = 0;
+    while (i < ln && argc < RESP_MAX_ARGC) {
+        while (i < ln && (rb->buf[i] == ' ' || rb->buf[i] == '\t')) i++;
+        if (i >= ln) break;
+        char q = 0;
+        if (rb->buf[i] == '\'' || rb->buf[i] == '"') {
+            q = rb->buf[i];
+            i++;
+        }
+        size_t start = i;
+        if (q) {
+            while (i < ln && rb->buf[i] != q) i++;
+            if (i >= ln) return RESP_PROTOCOL_ERROR; /* 引号未闭合 */
+            tok_start[argc] = start;
+            tok_end[argc] = i; /* 闭引号位置，改 \0 */
+            i++;
+            if (i < ln && rb->buf[i] != ' ' && rb->buf[i] != '\t')
+                return RESP_PROTOCOL_ERROR; /* "ab"c 非法 */
+        } else {
+            while (i < ln && rb->buf[i] != ' ' && rb->buf[i] != '\t') i++;
+            tok_start[argc] = start;
+            tok_end[argc] = i; /* 分隔空白位置，改 \0 */
+        }
+        argc++;
+        if (argc == RESP_MAX_ARGC && i < ln)
+            return RESP_PROTOCOL_ERROR; /* 参数超限 */
+    }
+
+    cmd->argv = malloc(sizeof(char *) * (size_t)argc);
+    cmd->argv_len = malloc(sizeof(size_t) * (size_t)argc);
+    if (!cmd->argv || !cmd->argv_len) {
+        free(cmd->argv);
+        free(cmd->argv_len);
+        return RESP_PROTOCOL_ERROR;
+    }
+    for (int k = 0; k < argc; k++) {
+        cmd->argv[k] = rb->buf + tok_start[k];
+        cmd->argv_len[k] = tok_end[k] - tok_start[k];
+        rb->buf[tok_end[k]] = '\0'; /* 分隔符改 NUL，argv 零拷贝 NUL 结尾 */
+    }
+    cmd->argc = (size_t)argc;
+    cmd->consumed = ln + 2;
+    return RESP_OK;
+}
+
 int resp_parse(RespBuf *rb, RespCmd *cmd) {
     cmd->argv = NULL;
     cmd->argv_len = NULL;
     cmd->argc = 0;
     cmd->consumed = 0;
 
-    if (rb->len < 3) return RESP_NEED_MORE;
-    if (rb->buf[0] != '*') return RESP_PROTOCOL_ERROR;
+    if (rb->len < 1) return RESP_NEED_MORE;
+    if (rb->buf[0] != '*') return resp_parse_inline(rb, cmd);
 
     size_t pos = 1, ln = 0;
     if (scan_crlf(rb, pos, &ln) != 0) return RESP_NEED_MORE;

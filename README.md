@@ -18,7 +18,7 @@
 | 里程碑 | 产出 | 硬验收 | 状态 |
 |---|---|---|---|
 | M0 | epoll TCP echo server | 多客户端并发压测不断链；能讲清 ET/LT | ✅ 见下 |
-| M1 | RESP2 解析器 + PING/SET/GET | 真机 redis-cli 互操作；处理 redis-cli 6+ 的 HELLO 回落 | 🔶 代码完成，11/11 自测绿；redis-cli 互操作待装 redis-tools |
+| M1 | RESP2 解析器 + PING/SET/GET/ECHO | 真机 redis-cli 互操作；处理 redis-cli 6+ 的 HELLO 回落 | ✅ 互操作对齐真 Redis：`errors: 0, replies: 3` |
 | M2 | 哈希表键空间 + DEL/EXPIRE/TTL 惰性过期 | redis-cli 验证 TTL 递减、过期返回 nil | ⬜ |
 | M3 | AOF 追加 + 启动回放 | SET 后 kill -9 重启，GET 读回一致 | ⬜ |
 | M4 | redis-benchmark 对拍同机 redis-server | QPS/P99 对比表 + README 取舍记录 | ⬜ |
@@ -70,23 +70,44 @@ ET 下排空是硬性要求（漏读=丢数据），LT 下是冗余但无害。
 echo 是轻负载，ET 的"少唤醒"优势要在"万级空闲连接 + 大量短请求"场景才放大，这正是 Redis
 单线程事件循环选 ET 的语境。README 的取舍记录到 M4 会用 redis-benchmark 数据补全。
 
-## M1：RESP2 协议层 + PING/SET/GET
+## M1：RESP2 协议层 + PING/SET/GET/ECHO（✅ 完成）
 
 ### 结构
 
 - `src/resp.c/.h` — 增量式 RESP2 命令解析（NEED_MORE 处理半包/粘包）+ 回复序列化
+  - 支持 **RESP 数组**（redis-cli 交互模式）
+  - 支持 **inline 命令**（`SET a x\r\n` 纯文本行，真 Redis processInlineBuffer 同款；
+    `redis-cli --pipe` 发的正是这个）
+  - 空行跳过、引号 `'...'`/`"..."` 切分、二进制安全（argv_len 与 NUL 结尾并存）
 - `src/dict.c/.h` — 键空间哈希表（djb2 + 链地址法 + 负载>0.75 扩容），值二进制安全
 - `src/server.c` — M0 的 epoll 底座上挂协议层，命令分发大小写不敏感
 
-### 互操作已知坑（写进验收）
-
-redis-cli 6+ 连上后**先发 `HELLO 3` 做 RESP3 握手**；server 回 `-ERR unknown
-command 'HELLO'` 后它自动回落 RESP2。M1 已按此实现并单测覆盖：HELLO → ERR 回落路径 ✅
-
-### 原生 socket 自测证据（2026-11-18，WSL2 / gcc 13.3）
+### 互操作硬证据（redis-cli 7.0.15 真机，mini-redis vs 真 Redis 输出逐字对齐）
 
 ```
-RESULT: 11/11 passed
+== 6. --pipe 批量 RESP ==
+All data transferred. Waiting for the last reply...
+Last reply received from server.
+errors: 0, replies: 3
+```
+
+HELLO 回落路径（redis-cli 6+ 先发 `HELLO 3` 做 RESP3 握手，server 回
+`-ERR unknown command 'HELLO'` 后自动回落 RESP2）✅，未实现命令干净报错不崩 ✅，
+`--pipe` 批量（inline + ECHO 探活）✅，`(nil)` 缺失语义 ✅。
+
+### 协议调试实例（面试少有的"我抓过 Redis 的包"素材）
+
+**现象**：`redis-cli --pipe` 批量 SET 后 key 不落库、输出 `No replies for 30
+seconds`。**定位**：用 nc 假服务器抓 redis-cli 发出的字节，再用 Python 中间人
+（MITM）对拍真 Redis，发现 `--pipe` 在转发完 inline 命令后，会**自附加一条
+`ECHO <随机token>` 探活命令**；真 Redis 原样回显 token 所以计数正常，而我们当时
+没实现 ECHO → 回 `-ERR` → 等不到 token 超时。**修复**：实现 ECHO + inline 支持。
+这类"用什么证据链定位一个问题"的过程，比"我写过 RESP 解析器"在面试里可信一个量级。
+
+### 原生 socket 自测（2026-11-18，WSL2 / gcc 13.3）
+
+```
+RESULT: 12/12 passed
   PASS  PING -> +PONG
   PASS  PING arg -> bulk
   PASS  SET/GET roundtrip
@@ -96,20 +117,21 @@ RESULT: 11/11 passed
   PASS  HELLO -> ERR (redis-cli 6+ 回落路径)
   PASS  wrong arg count -> ERR
   PASS  pipeline 3-in-1 packet
+  PASS  ECHO -> 原样回显（redis-cli --pipe 探活依赖）
   PASS  half packet (增量解析 NEED_MORE)
   PASS  30 concurrent x 20 ops
 ```
 
-过程小坑（教学价值）：最初想当然以为"set K v 后 get k 能取到"——错，那是把命令名
-大小写不敏感误当成 key 也不敏感。**Redis 命令名不敏感、key 敏感**，与真 Redis 语义
-对齐后测试才全绿。这类"自己写协议最容易想当然"的记录比代码本身更能体现理解。
+过程小坑：最初想当然"set K v 后 get k 能取到"——错，**Redis 命令名大小写不敏感、
+key 敏感**；对齐语义后测试才全绿。
 
 ### 运行
 
 ```bash
 make          # 编译 mini-redis（M1）+ echo-server（M0）
 ./mini-redis 7777
-make test     # M1 原生 socket 验收（11 用例）
+make test     # M1 原生 socket 验收（12 用例）
+bash tests/m1_interop_test.sh   # M1 redis-cli 互操作验收（需 redis-tools）
 make test-m0  # 回归 M0 压测
 ```
 

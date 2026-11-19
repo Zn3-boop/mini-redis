@@ -106,6 +106,13 @@ static void dispatch(RespCmd *cmd, RespOut *out) {
             resp_out_simple(out, "OK");
         else
             resp_out_error(out, "ERR out of memory");
+    } else if (strcasecmp(name, "ECHO") == 0) {
+        /* redis-cli --pipe 的探活依赖 ECHO 原样回显 token */
+        if (cmd->argc != 2) {
+            resp_out_error(out, "ERR wrong number of arguments for 'echo' command");
+            return;
+        }
+        resp_out_bulk(out, cmd->argv[1], cmd->argv_len[1]);
     } else if (strcasecmp(name, "GET") == 0) {
         if (cmd->argc != 2) {
             resp_out_error(out, "ERR wrong number of arguments for 'get' command");
@@ -140,6 +147,12 @@ static void handle_conn(int epfd, Conn *c) {
             int r = resp_parse(&c->rb, &cmd);
             if (r == RESP_NEED_MORE) return;          /* 半包：等下一次事件 */
             if (r == RESP_PROTOCOL_ERROR) { c->dead = 1; return; }
+            if (cmd.argc == 0) {                      /* inline 空行：跳过 */
+                free(cmd.argv);
+                free(cmd.argv_len);
+                resp_consume(&c->rb, cmd.consumed);
+                continue;
+            }
             g_commands++;
             RespOut out;
             resp_out_init(&out);
