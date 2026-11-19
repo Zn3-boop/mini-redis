@@ -81,10 +81,30 @@ int dict_get(const Dict *d, const char *key, DbValue *out) {
     size_t idx = djb2(key) % d->nbuckets;
     for (DictNode *n = d->buckets[idx]; n; n = n->next) {
         if (strcmp(n->key, key) == 0) {
-            out->data = n->val.data;
-            out->len = n->val.len;
+            if (out) {
+                out->data = n->val.data;
+                out->len = n->val.len;
+            }
             return 0;
         }
+    }
+    return -1;
+}
+
+int dict_del(Dict *d, const char *key) {
+    size_t idx = djb2(key) % d->nbuckets;
+    DictNode **pp = &d->buckets[idx];
+    while (*pp) {
+        if (strcmp((*pp)->key, key) == 0) {
+            DictNode *victim = *pp;
+            *pp = victim->next;
+            free(victim->key);
+            free(victim->val.data);
+            free(victim);
+            d->count--;
+            return 0;
+        }
+        pp = &(*pp)->next;
     }
     return -1;
 }

@@ -236,6 +236,12 @@ void resp_out_bulk(RespOut *o, const char *s, size_t n) {
     out_put(o, "\r\n", 2);
 }
 
+void resp_out_integer(RespOut *o, long long v) {
+    char hdr[32];
+    int hn = snprintf(hdr, sizeof hdr, ":%lld\r\n", v);
+    out_put(o, hdr, (size_t)hn);
+}
+
 void resp_out_error(RespOut *o, const char *msg) {
     out_put(o, "-", 1);
     out_put(o, msg, strlen(msg));

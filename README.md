@@ -19,7 +19,7 @@
 |---|---|---|---|
 | M0 | epoll TCP echo server | 多客户端并发压测不断链；能讲清 ET/LT | ✅ 见下 |
 | M1 | RESP2 解析器 + PING/SET/GET/ECHO | 真机 redis-cli 互操作；处理 redis-cli 6+ 的 HELLO 回落 | ✅ 互操作对齐真 Redis：`errors: 0, replies: 3` |
-| M2 | 哈希表键空间 + DEL/EXPIRE/TTL 惰性过期 | redis-cli 验证 TTL 递减、过期返回 nil | ⬜ |
+| M2 | 哈希表键空间 + DEL/EXPIRE/TTL 惰性过期 | redis-cli 验证 TTL 递减、过期返回 nil | ✅ 互操作 + 真 Redis 语义对拍对齐：TTL -2/-1、EXPIRE 0 立即删、SET 清 TTL |
 | M3 | AOF 追加 + 启动回放 | SET 后 kill -9 重启，GET 读回一致 | ⬜ |
 | M4 | redis-benchmark 对拍同机 redis-server | QPS/P99 对比表 + README 取舍记录 | ⬜ |
 | M5 | 可选：玩具主从 或 SETNX+过期锁 | 不承诺 | ⬜ |
@@ -27,10 +27,12 @@
 ## 构建与运行
 
 ```bash
-make            # 编译 ./echo-server
-make run        # 默认端口 7777，ET 模式
-./echo-server 7777 lt   # LT 模式
-make test       # M0 验收：30 并发 x 40 轮 + 8 x 64KB 大包，逐字节核对
+make            # 编译 mini-redis（M1/M2 主体）+ echo-server（M0）
+make run        # ./mini-redis 7777
+make test       # M1（12 用例）+ M2（14 用例）原生 socket 验收
+make test-m0    # M0 回归压测
+bash tests/m1_interop_test.sh   # M1 redis-cli 互操作
+bash tests/m2_interop_test.sh   # M2 redis-cli 互操作
 ```
 
 ## M0：epoll TCP echo server
@@ -134,6 +136,79 @@ make test     # M1 原生 socket 验收（12 用例）
 bash tests/m1_interop_test.sh   # M1 redis-cli 互操作验收（需 redis-tools）
 make test-m0  # 回归 M0 压测
 ```
+
+## M2：DEL/EXPIRE/TTL + 惰性过期（✅ 完成）
+
+### 设计：数据与过期元数据分离（对齐真 Redis `db->expires`）
+
+- `g_db`（Dict）：key → value，纯数据表
+- `g_exp`（复用同一 Dict）：key → 绝对过期时刻（毫秒，十进制字符串）
+- 删除路径全部**两表成对**：`expire_if_needed`（惰性过期）、`DEL`、`SET` 覆盖清 TTL
+
+惰性过期与真 Redis 同款触发点（`lookupKeyRead/lookupKeyWrite → expireIfNeeded`）：
+GET / EXPIRE / TTL 进入前先查过期表，`expire_at <= now` 则同步删除两表记录
+（`g_expired` 计数器进启动 stats），再继续走正常逻辑。未过期 key 只多一次哈希表
+探测的开销，零定时器。
+
+### 命令语义（与真 Redis 7.0.15 逐项对拍对齐）
+
+| 场景 | 返回 | 对齐 |
+|---|---|---|
+| `DEL` 命中/未命中/多 key | 1 / 0 / 命中数 | ✅ |
+| `EXPIRE` key 存在 / 不存在 | 1 / 0 | ✅ |
+| `EXPIRE k 0` 或负数（key 存在） | 立即删除，1 | ✅ |
+| `EXPIRE` 非数字 | `ERR value is not an integer or out of range` | ✅ |
+| `TTL` 无过期 / 不存在 / 已过期 | -1 / -2 / -2（触发回收） | ✅ |
+| `TTL` 剩余 | 毫秒四舍五入 `(rem+500)/1000` | ✅ |
+| `SET` 覆盖旧值 | 清除该 key 过期（TTL → -1） | ✅ |
+| `EXPIRE` 覆盖旧过期 | 取新值 | ✅ |
+
+### 原生 socket 自测（2026-11-18，WSL2 / gcc 13.3）
+
+```
+RESULT: 14/14 passed
+  PASS  DEL 存在的 key -> 1，随后 GET nil
+  PASS  DEL 不存在的 key -> 0
+  PASS  DEL 多 key -> 删除个数（含混搭不存在）
+  PASS  EXPIRE 不存在的 key -> 0
+  PASS  EXPIRE 非数字参数 -> ERR not an integer
+  PASS  SET/EXPIRE/TTL 全链：TTL 落在 [N-1, N]
+  PASS  TTL 无过期 -> -1
+  PASS  TTL 不存在 key -> -2
+  PASS  惰性过期：EXPIRE 1s 后 GET -> nil（key 被回收）
+  PASS  惰性过期：EXPIRE 后 TTL -> -2（TTL 触发回收）
+  PASS  SET 覆盖清掉过期：SET 后再 TTL -> -1
+  PASS  EXPIRE k 0 -> 立即删除
+  PASS  EXPIRE 覆盖旧过期（5 -> 50）
+  PASS  过期 key 被 GET 回收后，可正常重新 SET
+```
+
+### 真机互操作（redis-cli 7.0.15）
+
+```
+== 4. SET + EXPIRE 10s + TTL（应在 9~10 且单调递减）==
+(integer) 1
+(integer) 10
+(integer) 9          <- TTL 递减证据
+== 6. 惰性过期：EXPIRE 1s，sleep 后 GET -> (nil)、TTL -> -2 ==
+(integer) 1
+(nil)                <- 过期回收
+(integer) -2
+== 7. SET 覆盖清 TTL：SET -> EXPIRE -> SET -> TTL -> -1 ==
+(integer) -1
+== 8. EXPIRE k 0 -> 立即删除 ==
+(integer) 1
+(nil)
+```
+
+### 过程中的真 bug（M2 版面试素材）
+
+首版 `EXPIRE` 判断 key 存在性时用 `dict_get(&g_db, key, NULL)` 做存在性探测，
+而 `dict_get` 原实现命中后**无条件写 out** → NULL 解引用，服务器在第一个
+`EXPIRE <存在的key>` 处段错误，测试从第 6 个用例起全部 Connection refused。
+教训：**C 里"我传了 NULL 表示不关心"必须与接收方约定一致**；修复=dict_get 对
+`out==NULL` 防御（这也是真 Redis `dictFetchValue` 让调用方每次传地址的原因）。
+如果只修调用方不修接收方，同一个坑会在 EXPIRE/TTL/任何存在性探测处反复炸。
 
 ## 知识地图（覆盖边界）
 

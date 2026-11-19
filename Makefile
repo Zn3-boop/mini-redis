@@ -5,7 +5,7 @@ ECHO    := echo-server
 SRCS    := src/server.c src/resp.c src/dict.c
 OBJS    := $(SRCS:.c=.o)
 
-.PHONY: all run test test-m0 clean
+.PHONY: all run test test-m0 test-m2 clean
 
 all: $(TARGET) $(ECHO)
 
@@ -18,8 +18,13 @@ $(ECHO): src/echo_server.c
 run: $(TARGET)
 	./$(TARGET) 7777
 
-test: $(TARGET)
+test: test-m1 test-m2
+
+test-m1: $(TARGET)
 	python3 tests/m1_resp_test.py --bin ./$(TARGET)
+
+test-m2: $(TARGET)
+	python3 tests/m2_expire_test.py --bin ./$(TARGET)
 
 test-m0: $(ECHO)
 	python3 tests/m0_echo_test.py --bin ./$(ECHO)

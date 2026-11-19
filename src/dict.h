@@ -25,6 +25,7 @@ typedef struct {
 void dict_init(Dict *d);
 int  dict_set(Dict *d, const char *key, const char *data, size_t len); /* 0 ok, -1 oom */
 int  dict_get(const Dict *d, const char *key, DbValue *out);           /* 0 found, -1 miss */
+int  dict_del(Dict *d, const char *key);                               /* 0 deleted, -1 miss */
 void dict_free(Dict *d);
 
 #endif

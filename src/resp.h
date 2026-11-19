@@ -36,8 +36,9 @@ typedef struct {
 void resp_out_init(RespOut *o);
 void resp_out_simple(RespOut *o, const char *s);              /* +s\r\n    */
 void resp_out_bulk(RespOut *o, const char *s, size_t n);      /* $n\r\ns\r\n */
-void resp_out_error(RespOut *o, const char *msg);             /* -msg\r\n  */
-void resp_out_nil(RespOut *o);                                /* $-1\r\n   */
+void resp_out_integer(RespOut *o, long long v);               /* :v\r\n     */
+void resp_out_error(RespOut *o, const char *msg);             /* -msg\r\n   */
+void resp_out_nil(RespOut *o);                                /* $-1\r\n    */
 void resp_out_free(RespOut *o);
 
 #endif

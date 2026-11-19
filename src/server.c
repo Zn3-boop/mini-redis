@@ -17,6 +17,7 @@
 #include <strings.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "dict.h"
@@ -27,10 +28,14 @@
 #define READ_CHUNK     8192
 #define LISTEN_BACKLOG 512
 
+/* 键空间：数据表 + 独立过期表（对齐真 Redis db->expires 设计）。
+ * g_exp 的 value 是绝对过期时刻（ms）的十进制字符串。 */
 static Dict g_db;
+static Dict g_exp;
 static volatile sig_atomic_t g_stop = 0;
 static long g_clients = 0;
 static long long g_commands = 0;
+static long long g_expired = 0; /* 惰性过期实际删除的 key 数（stats 用） */
 
 typedef struct Conn {
     int fd;
@@ -87,6 +92,41 @@ static void conn_close(int epfd, Conn *c) {
     free(c);
 }
 
+/* === M2: 过期元数据 + 惰性过期 === */
+
+static long long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* 严格数字参数：strtoll 且必须整体消费，否则 -1（对齐 Redis "not an integer" 报错） */
+static int parse_ll_arg(const char *s, long long *out) {
+    char *end = NULL;
+    long long v = strtoll(s, &end, 10);
+    if (end == s || *end != '\0') return -1;
+    *out = v;
+    return 0;
+}
+
+static void set_expire(const char *key, long long at_ms) {
+    char buf[32];
+    int n = snprintf(buf, sizeof buf, "%lld", at_ms);
+    dict_set(&g_exp, key, buf, (size_t)n);
+}
+
+/* 返回 1 = 已过期并删除（数据表+过期表成对清理）；0 = 有效或不存在 */
+static int expire_if_needed(const char *key, long long now) {
+    DbValue v;
+    if (dict_get(&g_exp, key, &v) != 0) return 0;
+    long long at = strtoll(v.data, NULL, 10);
+    if (at > now) return 0;
+    dict_del(&g_db, key);
+    dict_del(&g_exp, key);
+    g_expired++;
+    return 1;
+}
+
 static void dispatch(RespCmd *cmd, RespOut *out) {
     const char *name = (cmd->argc > 0) ? cmd->argv[0] : "";
     if (strcasecmp(name, "PING") == 0) {
@@ -102,20 +142,21 @@ static void dispatch(RespCmd *cmd, RespOut *out) {
             resp_out_error(out, "ERR wrong number of arguments for 'set' command");
             return;
         }
-        if (dict_set(&g_db, cmd->argv[1], cmd->argv[2], cmd->argv_len[2]) == 0)
+        if (dict_set(&g_db, cmd->argv[1], cmd->argv[2], cmd->argv_len[2]) == 0) {
+            /* SET 覆盖旧值并清除该 key 的过期（真 Redis 语义） */
+            dict_del(&g_exp, cmd->argv[1]);
             resp_out_simple(out, "OK");
-        else
+        } else {
             resp_out_error(out, "ERR out of memory");
-    } else if (strcasecmp(name, "ECHO") == 0) {
-        /* redis-cli --pipe 的探活依赖 ECHO 原样回显 token */
-        if (cmd->argc != 2) {
-            resp_out_error(out, "ERR wrong number of arguments for 'echo' command");
-            return;
         }
-        resp_out_bulk(out, cmd->argv[1], cmd->argv_len[1]);
     } else if (strcasecmp(name, "GET") == 0) {
         if (cmd->argc != 2) {
             resp_out_error(out, "ERR wrong number of arguments for 'get' command");
+            return;
+        }
+        long long now = now_ms();
+        if (expire_if_needed(cmd->argv[1], now)) {
+            resp_out_nil(out);
             return;
         }
         DbValue v;
@@ -123,6 +164,75 @@ static void dispatch(RespCmd *cmd, RespOut *out) {
             resp_out_bulk(out, v.data, v.len);
         else
             resp_out_nil(out);
+    } else if (strcasecmp(name, "DEL") == 0) {
+        if (cmd->argc < 2) {
+            resp_out_error(out, "ERR wrong number of arguments for 'del' command");
+            return;
+        }
+        long long deleted = 0;
+        for (size_t i = 1; i < cmd->argc; i++) {
+            if (dict_del(&g_db, cmd->argv[i]) == 0) {
+                dict_del(&g_exp, cmd->argv[i]);
+                deleted++;
+            }
+        }
+        resp_out_integer(out, deleted);
+    } else if (strcasecmp(name, "EXPIRE") == 0) {
+        if (cmd->argc != 3) {
+            resp_out_error(out, "ERR wrong number of arguments for 'expire' command");
+            return;
+        }
+        long long seconds;
+        if (parse_ll_arg(cmd->argv[2], &seconds) != 0) {
+            resp_out_error(out, "ERR value is not an integer or out of range");
+            return;
+        }
+        long long now = now_ms();
+        expire_if_needed(cmd->argv[1], now);   /* 先回收已过期残留，key 不存在才回 0 */
+        if (dict_get(&g_db, cmd->argv[1], NULL) != 0) {
+            resp_out_integer(out, 0);
+            return;
+        }
+        if (seconds <= 0) {                    /* EXPIRE k 0/负数 = 立即删除 */
+            dict_del(&g_db, cmd->argv[1]);
+            dict_del(&g_exp, cmd->argv[1]);
+            resp_out_integer(out, 1);
+            return;
+        }
+        set_expire(cmd->argv[1], now + seconds * 1000);
+        resp_out_integer(out, 1);
+    } else if (strcasecmp(name, "TTL") == 0) {
+        if (cmd->argc != 2) {
+            resp_out_error(out, "ERR wrong number of arguments for 'ttl' command");
+            return;
+        }
+        long long now = now_ms();
+        expire_if_needed(cmd->argv[1], now);   /* TTL 也会触发惰性删除 */
+        if (dict_get(&g_db, cmd->argv[1], NULL) != 0) {
+            resp_out_integer(out, -2);
+            return;
+        }
+        DbValue v;
+        if (dict_get(&g_exp, cmd->argv[1], &v) != 0) {
+            resp_out_integer(out, -1);         /* 无过期设置 */
+            return;
+        }
+        long long rem = strtoll(v.data, NULL, 10) - now;
+        if (rem <= 0) {
+            dict_del(&g_db, cmd->argv[1]);
+            dict_del(&g_exp, cmd->argv[1]);
+            g_expired++;
+            resp_out_integer(out, -2);
+            return;
+        }
+        resp_out_integer(out, (rem + 500) / 1000); /* 毫秒→秒，四舍五入（真 Redis 同款） */
+    } else if (strcasecmp(name, "ECHO") == 0) {
+        /* redis-cli --pipe 的探活依赖 ECHO 原样回显 token */
+        if (cmd->argc != 2) {
+            resp_out_error(out, "ERR wrong number of arguments for 'echo' command");
+            return;
+        }
+        resp_out_bulk(out, cmd->argv[1], cmd->argv_len[1]);
     } else {
         char msg[160];
         snprintf(msg, sizeof msg, "ERR unknown command '%s'", name);
@@ -191,6 +301,7 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
     dict_init(&g_db);
+    dict_init(&g_exp);
 
     int lfd = make_listener(port);
     if (lfd < 0) return 1;
@@ -251,7 +362,9 @@ int main(int argc, char **argv) {
 
     close(epfd);
     close(lfd);
-    fprintf(stderr, "stats: clients=%ld commands=%lld\n", g_clients, g_commands);
+    fprintf(stderr, "stats: clients=%ld commands=%lld expired=%lld\n",
+            g_clients, g_commands, g_expired);
+    dict_free(&g_exp);
     dict_free(&g_db);
     return 0;
 }
