@@ -1,10 +1,10 @@
 # mini-redis
 
 用 C 从零实现一个兼容 `redis-cli` / `redis-benchmark` 的迷你 Redis。
-独立仓库，只服务一个目标：**把面试八股里的一半题从「我背过」变成「我写过」**。
+目标不是复制功能，而是把面试八股变成"我写过、测过、和真 Redis 对拍过"。
 
-> 与 d:\ecv / d:\ecv-paypal 无运行期依赖。两者均为 Python(FastAPI) 技术栈且无公网端点；
-> 本仓库的合法接缝是未来 d:\ecv 公网化时 `rate_limit.py` 的 Redis 后端升级（届时用真 Redis）。
+> 里程碑制推进（M0→M4），每个里程碑有独立验收证据：并发压测、
+> 真机 redis-cli 互操作、与 Redis 7.0.15 语义对拍、原生 socket 自测。
 
 ## 技术前提
 
